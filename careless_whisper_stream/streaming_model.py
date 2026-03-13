@@ -9,8 +9,10 @@ from .model import AudioEncoder, TextDecoder, Whisper
 
 from .streaming_decoding import DecodingTask, DecodingOptions, DecodingResult
 from .streaming_transcribe import transcribe as transcribe_function
+from .transcribe import transcribe as offline_transcribe_function
 from .decoding import decode as non_causal_decode_function
 from .audio import SpectrogramStream
+from .timing import add_word_timestamps
 
 from dataclasses import replace
 
@@ -143,6 +145,7 @@ class StreamingAudioEncoder(AudioEncoder):
                                                 rank)
 
         self.use_stream = False
+        self.use_mask = False
 
         # mask for training
         matrix_size = n_ctx
@@ -156,17 +159,17 @@ class StreamingAudioEncoder(AudioEncoder):
             else:
                 zero_cols = (block_size * (extra_blocks + 1)) + ((i // block_size) - extra_blocks) * block_size
 
-            mask[i:i + block_size, :zero_cols] = 1
+            mask[i:i + block_size, :zero_cols] = 0
 
         self.register_buffer("mask", mask, persistent=False)
 
     def _use_stream(self, use_stream: bool):
         self.use_stream = use_stream
 
+    def _use_mask(self, use_mask: bool):
+        self.use_mask = use_mask
+
     def forward(self, x: Tensor, index: list = [0, 1500], kv_cache = None, mask = True):
-        """
-        simulate streaming forward using qk cache self attn.
-        """
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
@@ -180,13 +183,17 @@ class StreamingAudioEncoder(AudioEncoder):
             x = (x + self.positional_embedding[index[0]:index[1]]).to(x.dtype)
 
         for block in self.blocks:
-            chosen_mask = mask[..., :index[1], :index[1]] if isinstance(mask, Tensor) else self.mask if (mask is not None) and (self.use_stream) else None 
+            chosen_mask = mask[..., :index[1], :index[1]] if isinstance(mask, Tensor) else self.mask if ((mask is not None) and (self.use_stream)) or ((mask is not None) and (self.use_mask)) else None
+            # chosen_mask = mask[..., :index[1], :index[1]] if isinstance(mask, Tensor) else self.mask if (mask is not None) else None
+            # print(f"{chosen_mask=}")
             x = block(x, mask=chosen_mask, kv_cache=kv_cache)
             
         x = self.ln_post(x)
 
         return x
 
+    def _no_mask_forward(self, x: Tensor):
+        return super().forward(x)
 
 class StreamingTextDecoder(TextDecoder):
     def __init__(self, n_vocab, n_ctx, n_state, n_head, n_layer, rank):
@@ -305,9 +312,17 @@ class StreamingWhisper(Whisper):
         for _, layer in self.encoder.named_modules():
             if isinstance(layer, LoraLinearLayer):
                 layer.turn_off_lora()
+        
+        for _, layer in self.decoder.named_modules():
+            if isinstance(layer, LoraLinearLayer):
+                layer.turn_off_lora()
     
     def _turn_on_lora(self):
         for _, layer in self.encoder.named_modules():
+            if isinstance(layer, LoraLinearLayer):
+                layer.turn_on_lora()
+        
+        for _, layer in self.decoder.named_modules():
             if isinstance(layer, LoraLinearLayer):
                 layer.turn_on_lora()
 
@@ -322,9 +337,26 @@ class StreamingWhisper(Whisper):
     @torch.no_grad()
     def non_causal_decode(self, mel: Tensor, options: DecodingOptions = DecodingOptions(), **kwargs) -> DecodingResult:
         self._cancel_streaming_mode()
-        results = non_causal_decode_function(self, mel, options, **kwargs)
+        results = non_causal_decode_function(self, self.encoder._no_mask_forward(mel), options, **kwargs)
+        self._revert_streaming_mode()        
+        return results
+
+    @torch.no_grad()
+    def non_causal_transcribe(self, audio, **kwargs):
+        self._cancel_streaming_mode()
+        results = offline_transcribe_function(self, audio, **kwargs)
         self._revert_streaming_mode()
         return results
+    
+    @torch.no_grad()
+    def _offline_word_timestamps(self, segments, tokenizer, mel, num_frames, last_speech_timestamp):
+        add_word_timestamps(segments=segments,
+                            model=self,
+                            tokenizer=tokenizer,
+                            mel=mel,
+                            num_frames=num_frames,
+                            last_speech_timestamp=last_speech_timestamp)
+        return segments
 
     def remove_encoder_kv_cache_hooks(self):
         for hook in self.encoder._forward_hooks.values():
@@ -441,4 +473,3 @@ class StreamingWhisper(Whisper):
 
     # refers to function from streaming_decoding, streaming_transcribe library
     transcribe = transcribe_function
-    

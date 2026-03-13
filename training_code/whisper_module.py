@@ -11,10 +11,11 @@ from torch.optim.adamw import AdamW
 from training_code.utils import Config
 from careless_whisper_stream import StreamingWhisper
 from careless_whisper_stream.audio import HOP_LENGTH
+from careless_whisper_stream.normalizers import EnglishTextNormalizer
 from pytorch_lightning import LightningModule
 from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau
-from training_code.datasets_classes import TIMIT, WAVsDataset, AlignedTextGridDataset
 from training_code.collators import WhisperDataCollatorWithPadding, LoRAWhisperDataCollatorWithPadding
+from training_code.datasets_classes import TIMIT, WAVsDataset, AlignedTextGridDataset, AlignedTextGridDatasetLMDB
 
 class WhisperCustomModel(LightningModule):
     def __init__(self, cfg:Config, model_name="tiny", lang="en", train_dataset: str = None, eval_dataset: str = None, task="transcribe") -> None:
@@ -45,8 +46,8 @@ class WhisperCustomModel(LightningModule):
         o_list, l_list = [], []
         for o, l in zip(out, labels):
             o = torch.argmax(o, dim=1)
-            o_list.append(self.tokenizer.decode(o))
-            l_list.append(self.tokenizer.decode(l))
+            o_list.append(self.normalizer(self.tokenizer.decode(o)))
+            l_list.append(self.normalizer(self.tokenizer.decode(l)))
             
         wer = self.metrics_wer.compute(references=l_list, predictions=o_list)
         return wer
@@ -148,22 +149,28 @@ class LoRAStreamedWhisper(WhisperCustomModel):
 
         # if model_name != "large-v2" and not eval_script:
         print(f"enc_emb_gran: {enc_emb_gran}")
-        self.model: StreamingWhisper = careless_whisper_stream.load_streaming_model_for_train(model_name, 
-                                                                        advisor_ckpt_path=None,
-                                                                        advisor_type=None,
-                                                                        rank=rank,
-                                                                        gran=enc_emb_gran,
-                                                                        extra_gran_blocks=enc_context,
-        )
+        if not cfg.use_from_ft_ckpt:
+            self.model: StreamingWhisper = careless_whisper_stream.load_streaming_model_for_train(model_name, 
+                                                                                    advisor_ckpt_path=None,
+                                                                                    advisor_type=None,
+                                                                                    rank=rank,
+                                                                                    gran=enc_emb_gran,
+                                                                                    extra_gran_blocks=enc_context,
+                                                                                    )
+        else:
+            self.model: StreamingWhisper = careless_whisper_stream.load_streaming_model(cfg.size, cfg.gran * 20)
         
         for n, p in self.model.named_parameters():
             if "lora" not in n:
                 p.requires_grad = False
 
+        self.normalizer = EnglishTextNormalizer()
+        self.model.encoder._use_mask(True)
+
         self.model_name = model_name
-        self.rank = rank
-        self.enc_emb_gran = enc_emb_gran
-        self.enc_context = enc_context
+        self.rank = self.model.rank
+        self.enc_emb_gran = self.model.gran
+        self.enc_context = self.model.extra_gran_blocks
         self.simulate_stream = sim_stream
         self.full_stream = cfg.streaming_train
         self.beam_size = beam_size
@@ -172,6 +179,7 @@ class LoRAStreamedWhisper(WhisperCustomModel):
         self.use_ca_kv_cache = use_ca_kv_cache
         self.get_times = get_times
         self.eval_script = eval_script
+        self.lmdb_paths = cfg.lmdb_paths
 
         # for stream mode train
         self.num_frames = self.model.dims.n_audio_ctx // self.enc_emb_gran # 1500 // enc_emb_gran
@@ -183,20 +191,50 @@ class LoRAStreamedWhisper(WhisperCustomModel):
         self.__train_dataset = train_dataset
         self.__eval_dataset = eval_dataset
 
-    def _calc_labels(self, labels: Tensor, endpoints: Tensor, index: int):
-        t_seconds = (index + 1) * self.enc_emb_gran * 0.02
-        
-        # take only relevant labels into account
-        mask = (endpoints <= t_seconds) & (endpoints != -100)
-        eot_indices = mask.int().argmin(dim=-1)
-        clone_labels = labels.clone()
-        
-        # ignore irrelevant labels
-        clone_labels[~mask] = -100
-        
-        # mark eot labels
-        clone_labels[range(labels.shape[0]), eot_indices] = self.tokenizer.eot 
-        return clone_labels
+    def _calc_labels(self, labels: Tensor, endpoints: Tensor, index: int, out: Tensor = None):
+        if self.cfg.self_supervision and out is not None:
+            # get predicted tokens
+            pred_tokens = torch.argmax(out, dim=-1)
+
+            # find first eot in predictions
+            eot_mask = (pred_tokens == self.tokenizer.eot)
+            eot_indices = eot_mask.int().argmax(dim=-1)
+
+            # create new labels
+            clone_labels = labels.clone()
+
+            for i in range(labels.shape[0]):
+                eot_idx = eot_indices[i].item()
+                if eot_idx < labels.shape[1]:
+                    clone_labels[i, :eot_idx + 1] = pred_tokens[i, :eot_idx + 1]
+                    clone_labels[i, eot_idx] = self.tokenizer.eot
+                    clone_labels[i, eot_idx + 1:] = -100
+                else:
+                    # no eot found, use all predictions
+                    clone_labels[i, :] = pred_tokens[i, :]
+            
+            # print("Self-supervision - using predicted tokens as labels")
+            # print(f"{labels=}")
+            # print(f"{pred_tokens=}")
+            # print(f"{eot_mask=}")
+            # print(f"{clone_labels=}")
+
+            return clone_labels
+        else:
+            t_seconds = (index + 1) * self.enc_emb_gran * 0.02
+            
+            # take only relevant labels into account
+            mask = (endpoints <= t_seconds) & (endpoints != -100)
+            eot_indices = mask.int().argmin(dim=-1)
+            
+            clone_labels = labels.clone()
+            
+            # ignore irrelevant labels
+            clone_labels[~mask] = -100
+            
+            # mark eot labels
+            clone_labels[range(labels.shape[0]), eot_indices] = self.tokenizer.eot 
+            return clone_labels
 
     def _get_sample_points(self, endpoints: Tensor):
         # base case
@@ -216,6 +254,42 @@ class LoRAStreamedWhisper(WhisperCustomModel):
 
         return sorted(sample_points)
 
+    def _get_sample_points_random_mask(self, endpoints: Tensor):
+        biggest_endpoint = endpoints.max().item()
+        ls_choices = list(range(5, 55, 5))
+        ls_weights = [15, 20, 25, 20, 15, 1, 1, 1, 1, 1]
+        lengths = [30]
+        curr_sum = 30
+        last_index = biggest_endpoint // 0.02
+
+        while curr_sum < last_index:
+            l = random.choices(ls_choices, weights=ls_weights, k=1)[0]
+            
+            if curr_sum + l > last_index:
+                l = (int(last_index - curr_sum) // 5) * 5
+                lengths.append(l)
+                break
+
+            lengths.append(l)
+            curr_sum += l
+        
+        sample_points = [sum(lengths[:i]) for i in range(1, len(lengths) + 1)]
+        mask = torch.full((sample_points[-1], sample_points[-1]), float("-inf"))
+        start = 0
+        for l in lengths:
+            end = start + l
+            mask[start:end, :end] = 0
+            start = end
+        
+
+        # Now sample self.cfg.slices_num points from sample_points, if there are less, return all.
+        if len(sample_points) <= self.cfg.slices_num:
+            sample_points = sorted(sample_points)
+        else:
+            sample_points = sorted(random.sample(sample_points, k=self.cfg.slices_num))
+
+        return sample_points, mask
+
     def _forward_step_stream(self, batch, step):
         input_ids = batch["input_ids"]
         labels = batch["labels"].long()
@@ -226,16 +300,24 @@ class LoRAStreamedWhisper(WhisperCustomModel):
             optimizer = self.optimizers()
 
         # forward
-        sample_points = self._get_sample_points(endpoints)
+        if self.cfg.random_masking:
+            sample_points, mask_value = self._get_sample_points_random_mask(endpoints)
+            mask_value = mask_value.to(input_ids.device)
+        else:
+            sample_points = self._get_sample_points(endpoints)
+
         for i in sample_points:
-            audio_features = self.model.encoder(input_ids[..., :(i + 1) * (self.enc_emb_gran * 2)], index=[0, (i + 1) * self.enc_emb_gran], mask=True)
+            if self.cfg.random_masking:
+                audio_features = self.model.encoder(input_ids[..., :i * 2], index=[0, i], mask=mask_value)
+            else:
+                audio_features = self.model.encoder(input_ids[..., :(i + 1) * (self.enc_emb_gran * 2)], index=[0, (i + 1) * self.enc_emb_gran], mask=True)
             out = self.model.decoder(dec_input_ids, audio_features, dump_type="None")
 
             if step == "train":
                 optimizer.zero_grad()
 
             # loss calc
-            frame_labels = self._calc_labels(labels, endpoints, i)
+            frame_labels = self._calc_labels(labels, endpoints, i, out if self.cfg.self_supervision else None)
             loss = self.loss_fn(out.view(-1, out.size(-1)), frame_labels.view(-1))
 
             # optimizer step if relevant.
@@ -311,8 +393,8 @@ class LoRAStreamedWhisper(WhisperCustomModel):
     def get_dataset(self, ds_path, split):
         print(f"Stream simulation mode: {self.simulate_stream}")
         
-        if self.full_stream:
-            return AlignedTextGridDataset(ds_path=ds_path, get_streamed_mel=True, gran=self.enc_emb_gran, extra_gran_blocks=self.enc_context, n_mels=self.model.dims.n_mels, multilingual=self.cfg.multilingual)
+        if self.full_stream and not self.cfg.self_supervision:
+            return AlignedTextGridDatasetLMDB(ds_path=ds_path, lmdb_paths=self.lmdb_paths, get_streamed_mel=True, gran=self.enc_emb_gran, extra_gran_blocks=self.enc_context, n_mels=self.model.dims.n_mels, multilingual=self.cfg.multilingual)
         
         return WAVsDataset(ds_path=ds_path, get_streamed_mel=self.simulate_stream)
     

@@ -202,7 +202,10 @@ def find_alignment(
         hook.remove()
 
     # heads * tokens * frames
-    weights = torch.stack([QKs[_l][_h] for _l, _h in model.alignment_heads.indices().T])
+    # weights = torch.stack([QKs[_l][_h] for _l, _h in model.alignment_heads.indices().T])
+    # Replace line 205 with this:
+    adj_indices = model.alignment_heads.indices().T if model.alignment_heads.is_sparse else model.alignment_heads.nonzero()
+    weights = torch.stack([QKs[_l][_h] for _l, _h in adj_indices])
     weights = weights[:, :, : num_frames // 2]
     weights = (weights * qk_scale).softmax(dim=-1)
     std, mean = torch.std_mean(weights, dim=-2, keepdim=True, unbiased=False)

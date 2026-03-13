@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 import os
 import torch
+import faulthandler, sys
 from pathlib import Path
-from ds_dict import ds_paths
+from ds_dict_private import ds_paths
 from whisper_module import LoRAStreamedWhisper
 from training_code.utils import Config, parse_cmdl
 from pytorch_lightning.loggers import  WandbLogger
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 
+# faulthandler.enable()
+# faulthandler.dump_traceback_later(900, repeat=False, file=sys.stderr)
+# print("faulthandler enabled", flush=True)
 
 SEED = 3407
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# DEVICE = "cpu"
+# DEVICE = "cpu" 
 seed_everything(SEED, workers=True)
 torch.set_float32_matmul_precision("high")
 
@@ -40,7 +44,15 @@ def train_model(log_output_dir, check_output_dir, model_name, train_set, val_set
         dirpath=f"{check_output_dir}/checkpoint",
         filename="checkpoint-{epoch:04d}",
         save_top_k=cfg.top_k, # Best model save,
-        monitor="val/wer"
+        monitor="val/wer",
+        every_n_epochs=1
+    )
+
+    steps_ckpt_callback = ModelCheckpoint(
+        dirpath=f"{check_output_dir}/steps_checkpoint",
+        filename="steps-checkpoint-{step:09d}",
+        save_top_k=-1, # Save all
+        every_n_train_steps=500
     )
 
     callback_list = [checkpoint_callback, LearningRateMonitor(logging_interval="epoch")]
@@ -67,6 +79,7 @@ def train_model(log_output_dir, check_output_dir, model_name, train_set, val_set
         num_sanity_val_steps=1,
         strategy=cfg.strategy,
         fast_dev_run=cfg.fast_dev_run,
+        # devices=8
         # precision="16"
         # accumulate_grad_batches=cfg.gradient_accumulation_steps,
     )
@@ -112,8 +125,18 @@ if __name__ == "__main__":
         streaming_fraction=args.streaming_fraction,
         seed=SEED,
         multilingual=args.multilingual,
-        custom_len=args.custom_len
+        custom_len=args.custom_len,
+        use_from_ft_ckpt=args.use_from_ft_ckpt,
+        lmdb=args.lmdb,
+        self_supervision=args.self_supervision,
+        slices_num=args.num_slices,
+        random_masking=args.random_masking
     )
+
+    if args.lmdb:
+        # Set lmdb paths for datasets
+        cfg.lmdb_paths = {key: ds_paths[key].get('train-lmdb', None) for key in args.dataset}
+        print(f"Using LMDB paths: {cfg.lmdb_paths}")
 
     if cfg.streaming_train:
         assert cfg.sim_stream == cfg.streaming_train, "When running in full stream mode you must simulate streaming!"
@@ -121,9 +144,12 @@ if __name__ == "__main__":
 
     lr_addition = f"_LR-{cfg.learning_rate}"
     effective_bsize = cfg.batch_size * cfg.gradient_accumulation_steps
-    
+
+    if cfg.random_masking:
+        cfg.name += f"_random-masking{cfg.slices_num}"
+
     if cfg.lora and cfg.streaming_train:
-        dir_name = f"LoRA_streamed_whisper_{cfg.size}_{cfg.dataset}_{effective_bsize}_{cfg.name}{lr_addition}_r{cfg.rank}_g{cfg.gran}_eg{cfg.extra_gran_blocks}_top{cfg.top_k}_full-stream{cfg.streaming_train}_random-order{cfg.streaming_random}_fraction{cfg.streaming_fraction}"
+        dir_name = f"LoRA_streamed_whisper_{cfg.size}_{'-'.join(cfg.dataset)}_{effective_bsize}_{cfg.name}{lr_addition}_r{cfg.rank}_g{cfg.gran}_eg{cfg.extra_gran_blocks}_top{cfg.top_k}_full-stream{cfg.streaming_train}_random-order{cfg.streaming_random}_fraction{cfg.streaming_fraction}"
         project_name = "lora"
     
     # Run trainer
@@ -131,8 +157,8 @@ if __name__ == "__main__":
         log_output_dir=os.path.join(logs_root, dir_name),
         check_output_dir=os.path.join(ckpt_root, dir_name),
         model_name=args.size,
-        train_set=ds_paths[args.dataset]['train'],
-        val_set=ds_paths[args.dataset]['val'],
+        train_set=[ds_paths[key]['train'] for key in args.dataset],
+        val_set=[ds_paths[key]['val'] for key in args.dataset],
         train_name=dir_name,
         project_name=project_name,
         cfg=cfg
