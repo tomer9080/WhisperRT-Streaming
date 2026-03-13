@@ -290,8 +290,15 @@ def load_streaming_model(
         ckpt_path = hf_hub_download(repo_id="MLSpeech/CarelessWhisper-Streaming", filename=_STREAMING_MODELS_HF[name][subname], repo_type="model", token=True)
     except KeyError as e:
         print(f"Streaming model with the next configs: size {name}, multilingual: {multilingual} and chunk size: {gran} is not available.")
-        
-    checkpoint = torch.load(ckpt_path, weights_only=False)
+        print("Trying to use the provided name as a path to a checkpoint...")    
+        ckpt_path = name
+
+    print(f"Loading streaming model from {ckpt_path}...")
+
+    try:        
+        checkpoint = torch.load(ckpt_path, weights_only=False)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Could not find the checkpoint at {ckpt_path}.") from e
 
     dims = ModelDimensions(**checkpoint["dims"])
 
