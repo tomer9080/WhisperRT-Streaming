@@ -169,6 +169,10 @@ class StreamingAudioEncoder(AudioEncoder):
     def _use_mask(self, use_mask: bool):
         self.use_mask = use_mask
 
+    def _update_granularity(self, gran: int, extra_gran_blocks: int):
+        self.gran = gran
+        self.extra_gran_blocks = extra_gran_blocks
+
     def forward(self, x: Tensor, index: list = [0, 1500], kv_cache = None, mask = True):
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
@@ -244,15 +248,19 @@ class StreamingTextDecoder(TextDecoder):
 
 
 class StreamingWhisper(Whisper):
-    def __init__(self, dims, cache_gran: bool = True, gran: int = 16, rank: int = 0, extra_gran_blocks: int = 0):
+    def __init__(self, dims, cache_gran: bool = True, gran: int = 16, rank: int = 0, extra_gran_blocks: int = 0, random_masked_model: bool = False):
         super().__init__(dims)
 
         self.cache_gran = cache_gran
         self.gran = gran
         self.rank = rank
         self.extra_gran_blocks = extra_gran_blocks
-        
-        print(f"Running a streaming whisper model, using chunk size: {gran * 20}[msec] and {extra_gran_blocks} extra chunks for initialization.")
+        self.random_masked_model = random_masked_model
+
+        if not self.random_masked_model:
+            print(f"Running a streaming whisper model, using chunk size: {gran * 20}[msec] and {extra_gran_blocks} extra chunks for initialization.")
+        else:
+            print(f"Running a random masked streaming whisper model, using chunk size: {gran * 20}[msec], {extra_gran_blocks} extra chunks for initialization and random masking during training.")
 
         # The only difference is a streaming encoder
         self.encoder = StreamingAudioEncoder(
@@ -299,9 +307,14 @@ class StreamingWhisper(Whisper):
         if use_frames: # mel is frames of audio, need to calc mel
             mel = self.spec_streamer.calc_mel_with_new_frame(mel).squeeze(0)
 
-        if self.encoder.gran != options.gran:
+        # if not a random masked model - force granularity.
+        if self.encoder.gran != options.gran and not self.random_masked_model:
             print(f"Encoder gran & options gran differ. forcing options to be on encoder's gran: {self.encoder.gran}")
             options.gran = self.encoder.gran
+        
+        if self.random_masked_model:
+            # print(f"Random masked model - using options granularity {options.gran} without forcing it to be the encoder's granularity {self.encoder.gran}")
+            self.encoder._update_granularity(options.gran, options.look_ahead_blocks)
 
         if not self.decoding_task:
             self.decoding_task = DecodingTask(self, options)

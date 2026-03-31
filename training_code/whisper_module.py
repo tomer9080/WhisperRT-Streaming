@@ -213,15 +213,13 @@ class LoRAStreamedWhisper(WhisperCustomModel):
                     # no eot found, use all predictions
                     clone_labels[i, :] = pred_tokens[i, :]
             
-            # print("Self-supervision - using predicted tokens as labels")
-            # print(f"{labels=}")
-            # print(f"{pred_tokens=}")
-            # print(f"{eot_mask=}")
-            # print(f"{clone_labels=}")
-
             return clone_labels
+            
         else:
-            t_seconds = (index + 1) * self.enc_emb_gran * 0.02
+            if not self.cfg.random_masking:
+                t_seconds = (index + 1) * self.enc_emb_gran * 0.02
+            else:
+                t_seconds = index * 0.02
             
             # take only relevant labels into account
             mask = (endpoints <= t_seconds) & (endpoints != -100)

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+import re
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -1177,6 +1178,28 @@ class DecodingTask:
         self.audio_features = torch.zeros((1, self.model.dims.n_audio_ctx, self.model.dims.n_audio_state)).to(self.model.device)
         print("Finished reset...")
 
+    def _clean_transcription_timestamps(self, text: str) -> str:
+        """
+        Removes punctuation and their immediately following timestamps 
+        from a BPE-encoded transcription string.
+        """
+        # Pattern explanation:
+        # [,.:;!?]      -> Matches the punctuation mark
+        # <\|           -> Matches the opening tag <|
+        # \d+           -> Matches one or more digits (d or dd)
+        # \.            -> Matches the decimal point
+        # \d+           -> Matches one or more digits after the decimal
+        # \|>           -> Matches the closing tag |>
+        pattern = r'[,.:;!?]<\|\d+\.\d+\|>'
+
+        # 1. Remove the punctuation + timestamp pairs
+        cleaned = re.sub(pattern, '', text)
+
+        # 2. Fix potential double spaces left behind and trim edges
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        return cleaned
+
     @torch.no_grad()
     def run(self, mel_frame: Tensor) -> List[DecodingResult]:
         """
@@ -1237,13 +1260,6 @@ class DecodingTask:
         # select the top-ranked sample in each group
         selected = self.sequence_ranker.rank(tokens, sum_logprobs)
         tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
-
-        # if self.options.localagreement:
-        #     tokens = self.decoder.local_agreement_words(tokens[0], tokenizer, self.frame_counter)
-        #     self.tokens = torch.tensor(list(self.sot_sequence) + tokens[0]).unsqueeze(0).long().to(self.model.device)
-        #     self.tokens = self.tokens.repeat_interleave(self.n_group, dim=0) if self.n_group > 1 else self.tokens.unsqueeze(0)
-        #     if len(tokens) == 0:
-        #         return self._empty_results()
         
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
@@ -1277,7 +1293,7 @@ class DecodingTask:
                 compression_ratio=compression_ratio(texts[0]),
                 timestamps=None if not hasattr(self.decoder, 'timestamps_map') else self.decoder.timestamps_map,
                 timed_tokens=timed_tokens,
-                timed_text=self.tokenizer.decode_with_timestamps(timed_tokens)
+                timed_text=self._clean_transcription_timestamps(self.tokenizer.decode_with_timestamps(timed_tokens))
             )
     
 

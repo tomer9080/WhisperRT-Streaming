@@ -39,6 +39,8 @@ def transcribe(
     max_sec_context: int = 30,
     streaming_timestamps: bool = False,
     force_first_tokens_timestamps: bool = False,
+    ms_granularity: int = None,
+    extra_initial_blocks: int = None,
     **kwargs
 ) -> List[str]:
     """
@@ -59,7 +61,8 @@ def transcribe(
     model.eval()
     
     # Instantiate streaming instance and open a stream
-    ms_gran = model.encoder.gran * 20
+    ms_gran = model.encoder.gran * 20 if ms_granularity is None else ms_granularity
+    assert ms_gran % 20 == 0, "ms_granularity must be a multiple of 20"
     stream_instance = MyStream(ms_gran,
                                channels=channels,
                                filename=output_filename, 
@@ -73,16 +76,18 @@ def transcribe(
     # frames - used only when filename is given, in order to save a long wav at the end of the conversation.
     frames = []
 
+    extra_gran_blocks = extra_initial_blocks if extra_initial_blocks is not None else model.encoder.extra_gran_blocks
+
     # first we'll use
     decoding_options = DecodingOptions(
         language=language,
-        gran=model.encoder.gran,
+        gran=(ms_gran // 20),
         single_frame_mel=single_frame_mel,
         without_timestamps=True,
         beam_size=beam_size if temperature == 0 else None,
         temperature=temperature,
         length_penalty=None,
-        look_ahead_blocks=model.encoder.extra_gran_blocks,
+        look_ahead_blocks=extra_gran_blocks,
         patience=None,
         stream_decode=stream_decode,
         use_kv_cache=sa_kv_cache,
@@ -136,16 +141,6 @@ def transcribe(
         stream_instance.close_stream(frames)
     
     print("Finished capturing audio.")
-
-    # Run another iteration with zeros input frames to finish decoding for local agreement.
-    # if decoding_options.localagreement:
-    #     print("Running local agreement finishing pass...")
-    #     zero_frames = np.zeros((stream_instance.chunk_size), dtype=np.float32)
-    #     zero_frame_tensor = torch.from_numpy(zero_frames).pin_memory()
-    #     mel_frame = streamed_spectrogram.calc_mel_with_new_frame(zero_frame_tensor.to(model.device, non_blocking=True))
-    #     result = model.decode(mel_frame.squeeze(0), decoding_options)
-    #     print(result.text)
-    #     texts.append(result)
     
     return texts, times
 
